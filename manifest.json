@@ -1,0 +1,10 @@
+{
+  "id": "keyword-time-search",
+  "name": "Keyword Time Search",
+  "version": "1.0.0",
+  "minAppVersion": "1.4.0",
+  "description": "Type a keyword and see every note containing it on a vertical timeline, newest first. Jump to any hit with one click.",
+  "author": "shuishuishui018",
+  "authorUrl": "https://github.com/shuishuishui018",
+  "isDesktopOnly": false
+}
