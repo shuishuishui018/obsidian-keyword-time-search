@@ -3,3 +3,4 @@ main.js
 *.zip
 .ghtoken
 publish.js
+test/

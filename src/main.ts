@@ -117,11 +117,13 @@ function escapeHtml(text: string): string {
         .replace(/"/g, "&quot;");
 }
 
-/** 毫秒时间戳 → YYYYMMDDHHmm */
+/** 毫秒时间戳 → YYYYMMDDHHmmss（14 位，与思源版时间格式对齐，保证 parseTime 可用） */
 function tsToStamp(ms: number): string {
     const d = new Date(ms);
     const p = (n: number, len = 2) => String(n).padStart(len, "0");
-    return `${p(d.getFullYear(), 4)}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}`;
+    return `${p(d.getFullYear(), 4)}${p(d.getMonth() + 1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(
+        d.getSeconds()
+    )}`;
 }
 
 function parseTime(s: string | null): Date | null {
@@ -224,7 +226,7 @@ function highlight(escaped: string, keywords: string[]): string {
     return result;
 }
 
-class TimelineView extends ItemView {
+export class TimelineView extends ItemView {
     private plugin: KeywordTimeSearchPlugin;
     private inputEl: HTMLInputElement | null = null;
     private keywords: string[] = [];
