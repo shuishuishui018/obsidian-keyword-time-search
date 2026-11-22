@@ -1,6 +1,6 @@
 {
   "name": "obsidian-keyword-time-search",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Obsidian plugin: show every note containing a keyword on a vertical timeline",
   "scripts": {
     "build": "node build.js",
