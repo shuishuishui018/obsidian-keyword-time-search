@@ -47,7 +47,7 @@ No indexing, no background process. On search it walks your markdown files via t
 
 The plugin is free, with nothing locked. If it helped you dig up notes you had long forgotten, you can buy me a coffee — entirely optional.
 
-<img src="https://raw.githubusercontent.com/shuishuishui018/obsidian-keyword-time-search/main/funding-qr.png" alt="WeChat tip QR" width="240">
+<img src="funding-qr.png" alt="WeChat tip QR" width="240">
 
 Scan with WeChat. Thanks!
 

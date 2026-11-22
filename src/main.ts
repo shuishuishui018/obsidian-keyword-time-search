@@ -1,4 +1,4 @@
-import { ItemView, Notice, Plugin, TFile, WorkspaceLeaf, getLanguage } from "obsidian";
+import { ItemView, Notice, Plugin, TFile, WorkspaceLeaf, getLanguage, setIcon } from "obsidian";
 
 const VIEW_TYPE = "kts-timeline-view";
 /** 与 manifest.json 的 version 保持一致 */
@@ -7,8 +7,6 @@ const PLUGIN_VERSION = "1.0.0";
 const MAX_DOCS = 500;
 /** 单文件读取上限（跳过超大文件） */
 const MAX_FILE_SIZE = 2 * 1024 * 1024;
-
-const SEARCH_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>`;
 
 const WEEKDAYS_ZH = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 const WEEKDAYS_EN = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -20,6 +18,7 @@ function T() {
     if (isZh()) {
         return {
             viewName: "时间线搜索",
+            commandName: "按时间线搜索关键词",
             placeholder: "搜索关键词，空格分词",
             sortByModified: "修改时间",
             sortByCreated: "创建时间",
@@ -32,22 +31,22 @@ function T() {
             today: "今天",
             yesterday: "昨天",
             unknownTime: "未知时间",
-            untitled: "未命名笔记",
             moreHits: "还有",
             hitUnit: "处命中",
             searchFailed: "搜索失败：",
+            missingFile: "文件不存在：",
             chipAll: "全部",
             chip7: "7天",
             chip30: "30天",
             chip90: "90天",
             chip365: "1年",
-            docUnit: () => "篇",
+            docUnit: (_n: number) => "篇",
             open: "打开笔记",
-            hint: "快捷键 Mod+Alt+F 可随时唤出",
         };
     }
     return {
         viewName: "Timeline Search",
+        commandName: "Search keywords on a timeline",
         placeholder: "Search keywords, space-separated",
         sortByModified: "Modified",
         sortByCreated: "Created",
@@ -60,10 +59,10 @@ function T() {
         today: "Today",
         yesterday: "Yesterday",
         unknownTime: "Unknown time",
-        untitled: "Untitled",
         moreHits: "and",
         hitUnit: "more",
         searchFailed: "Search failed: ",
+        missingFile: "File not found: ",
         chipAll: "All",
         chip7: "7 days",
         chip30: "30 days",
@@ -71,7 +70,6 @@ function T() {
         chip365: "1 year",
         docUnit: (n: number) => (n === 1 ? "note" : "notes"),
         open: "Open note",
-        hint: "Press Mod+Alt+F to summon it anytime",
     };
 }
 
@@ -86,38 +84,23 @@ const TYPE_LABELS: Record<string, { zh: string; en: string }> = {
     html: { zh: "HTML", en: "HTML" },
 };
 
-interface HitRow {
-    line: number;
-    type: string;
-    content: string;
-}
-
 interface EntryHit {
     key: string;
     type: string;
     content: string;
-    line: number;
 }
 
 interface DocEntry {
     path: string;
     title: string;
-    /** YYYYMMDDHHmm，沿用思源版的时间字符串格式，便于复用同一套格式化函数 */
+    /** YYYYMMDDHHmmss，14 位时间串，便于统一格式化 */
     time: string;
     hits: EntryHit[];
 }
 
 type TimeFilter = { type: "all" } | { type: "days"; days: number };
 
-function escapeHtml(text: string): string {
-    return text
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
-}
-
-/** 毫秒时间戳 → YYYYMMDDHHmmss（14 位，与思源版时间格式对齐，保证 parseTime 可用） */
+/** 毫秒时间戳 → YYYYMMDDHHmmss */
 function tsToStamp(ms: number): string {
     const d = new Date(ms);
     const p = (n: number, len = 2) => String(n).padStart(len, "0");
@@ -169,7 +152,7 @@ function monthLabel(s: string): string {
     return isZh() ? `${d.getFullYear()}年${d.getMonth() + 1}月` : `${d.toLocaleString("en", { month: "long" })} ${d.getFullYear()}`;
 }
 
-/** 去掉 markdown 标记，只留可读文本（用于片段展示；展示前统一 HTML 转义） */
+/** 去掉 markdown 标记，只留可读文本 */
 function stripMd(line: string): string {
     return line
         .replace(/^\s*>\s?/, "")
@@ -212,29 +195,50 @@ function snippetAround(content: string, keywords: string[], radius = 55): string
     return (start > 0 ? "…" : "") + compact.slice(start, end) + (end < compact.length ? "…" : "");
 }
 
-/** 关键词高亮（入参已 HTML 转义） */
-function highlight(escaped: string, keywords: string[]): string {
-    let result = escaped;
-    for (const kw of keywords) {
-        const pattern = kw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-        try {
-            result = result.replace(new RegExp(pattern, "gi"), (m) => `<mark>${m}</mark>`);
-        } catch (e) {
-            // 忽略非法正则
-        }
+/**
+ * 把文本按关键词切分后写入元素，命中部分用 <mark> 包裹。
+ * 全程走 DOM 节点，不拼接 HTML 字符串。
+ */
+function appendHighlighted(parent: HTMLElement, text: string, keywords: string[]) {
+    const kws = keywords.filter((k) => k.length > 0);
+    if (kws.length === 0 || !text) {
+        if (text) parent.appendText(text);
+        return;
     }
-    return result;
+    const pattern = kws.map((k) => k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    let re: RegExp;
+    try {
+        re = new RegExp(pattern, "gi");
+    } catch {
+        parent.appendText(text);
+        return;
+    }
+    let last = 0;
+    let m = re.exec(text);
+    while (m !== null) {
+        if (m.index > last) parent.appendText(text.slice(last, m.index));
+        if (m[0].length === 0) {
+            re.lastIndex++;
+        } else {
+            parent.createEl("mark", { text: m[0] });
+            last = m.index + m[0].length;
+        }
+        m = re.exec(text);
+    }
+    if (last < text.length) parent.appendText(text.slice(last));
 }
 
 export class TimelineView extends ItemView {
     private plugin: KeywordTimeSearchPlugin;
     private inputEl: HTMLInputElement | null = null;
+    private metaEl: HTMLElement | null = null;
+    private chipsEl: HTMLElement | null = null;
+    private timelineEl: HTMLElement | null = null;
     private keywords: string[] = [];
     private sortMode: "updated" | "created" = "updated";
     private timeFilter: TimeFilter = { type: "all" };
     private expanded = new Set<string>();
     private entries: DocEntry[] = [];
-    private entryCache = new Map<string, DocEntry>();
     private hitMap = new Map<string, { path: string; line: number }>();
     private seq = 0;
     private timer: number | null = null;
@@ -266,38 +270,45 @@ export class TimelineView extends ItemView {
         const root = this.contentEl;
         root.empty();
         root.addClass("kts-view-root");
-        root.innerHTML = `<div class="kts-wrap">
-  <div class="kts-head">
-    <label class="kts-search">
-      <span class="kts-search-icon">${SEARCH_ICON}</span>
-      <input class="kts-input" type="text" placeholder="${escapeHtml(t.placeholder)}" />
-    </label>
-    <div class="kts-seg">
-      <button class="kts-seg-btn kts-on" data-sort="updated">${escapeHtml(t.sortByModified)}</button>
-      <button class="kts-seg-btn" data-sort="created">${escapeHtml(t.sortByCreated)}</button>
-    </div>
-  </div>
-  <div class="kts-meta"></div>
-  <div class="kts-chips"></div>
-  <div class="kts-scroll">
-    <div class="kts-timeline">
-      <div class="kts-hint">${escapeHtml(t.idle)}</div>
-    </div>
-  </div>
-</div>`;
 
-        this.inputEl = root.querySelector<HTMLInputElement>(".kts-input");
+        const wrap = root.createDiv({ cls: "kts-wrap" });
 
-        root.querySelectorAll<HTMLButtonElement>(".kts-seg-btn").forEach((btn) => {
+        const head = wrap.createDiv({ cls: "kts-head" });
+        const searchBox = head.createEl("label", { cls: "kts-search" });
+        const iconEl = searchBox.createSpan({ cls: "kts-search-icon" });
+        setIcon(iconEl, "search");
+        this.inputEl = searchBox.createEl("input", {
+            cls: "kts-input",
+            attr: { type: "text", placeholder: t.placeholder },
+        });
+
+        const seg = head.createDiv({ cls: "kts-seg" });
+        const segButtons: { mode: "updated" | "created"; label: string }[] = [
+            { mode: "updated", label: t.sortByModified },
+            { mode: "created", label: t.sortByCreated },
+        ];
+        for (const item of segButtons) {
+            const btn = seg.createEl("button", {
+                cls: item.mode === this.sortMode ? "kts-seg-btn kts-on" : "kts-seg-btn",
+                text: item.label,
+            });
+            btn.setAttr("data-sort", item.mode);
             this.registerDomEvent(btn, "click", () => {
-                const mode = btn.getAttribute("data-sort") === "created" ? "created" : "updated";
-                if (mode === this.sortMode) return;
-                this.sortMode = mode;
-                root.querySelectorAll(".kts-seg-btn").forEach((b) => b.classList.remove("kts-on"));
-                btn.classList.add("kts-on");
+                if (item.mode === this.sortMode) return;
+                this.sortMode = item.mode;
+                for (const b of Array.from(seg.children)) {
+                    b.removeClass("kts-on");
+                }
+                btn.addClass("kts-on");
                 if (this.entries.length > 0) void this.search();
             });
-        });
+        }
+
+        this.metaEl = wrap.createDiv({ cls: "kts-meta" });
+        this.chipsEl = wrap.createDiv({ cls: "kts-chips" });
+        const scroll = wrap.createDiv({ cls: "kts-scroll" });
+        this.timelineEl = scroll.createDiv({ cls: "kts-timeline" });
+        this.timelineEl.createDiv({ cls: "kts-hint", text: t.idle });
 
         const input = this.inputEl;
         if (input) {
@@ -313,50 +324,45 @@ export class TimelineView extends ItemView {
             });
         }
 
-        const chips = root.querySelector<HTMLElement>(".kts-chips");
-        if (chips) {
-            this.registerDomEvent(chips, "click", (e: MouseEvent) => {
-                const chip = (e.target as HTMLElement).closest("[data-days]");
-                if (!chip) return;
-                const days = parseInt(chip.getAttribute("data-days") || "0", 10);
-                this.timeFilter = days > 0 ? { type: "days", days } : { type: "all" };
-                this.renderAll();
-            });
-        }
+        this.registerDomEvent(this.chipsEl, "click", (e: MouseEvent) => {
+            const chip = (e.target as HTMLElement).closest("[data-days]");
+            if (!chip) return;
+            const days = parseInt(chip.getAttribute("data-days") || "0", 10);
+            this.timeFilter = days > 0 ? { type: "days", days } : { type: "all" };
+            this.renderAll();
+        });
 
-        const scroll = root.querySelector<HTMLElement>(".kts-scroll");
-        if (scroll) {
-            this.registerDomEvent(scroll, "click", (e: MouseEvent) => {
-                const target = e.target as HTMLElement;
+        this.registerDomEvent(scroll, "click", (e: MouseEvent) => {
+            const target = e.target as HTMLElement;
 
-                const moreBtn = target.closest("[data-more]");
-                if (moreBtn) {
-                    const idx = parseInt(moreBtn.getAttribute("data-more") || "-1", 10);
-                    const entry = this.entries[idx];
-                    const box = scroll.querySelector<HTMLElement>(`[data-snips="${idx}"]`);
-                    if (entry && box) {
-                        box.innerHTML = this.renderSnippets(entry.hits, entry.hits.length);
-                        this.expanded.add(entry.path);
-                    }
-                    moreBtn.remove();
-                    return;
+            const moreBtn = target.closest("[data-more]");
+            if (moreBtn) {
+                const idx = parseInt(moreBtn.getAttribute("data-more") || "-1", 10);
+                const entry = this.entries[idx];
+                const box = scroll.querySelector<HTMLElement>(`[data-snips="${idx}"]`);
+                if (entry && box) {
+                    box.empty();
+                    for (const hit of entry.hits) this.buildSnippet(hit, box);
+                    this.expanded.add(entry.path);
                 }
+                moreBtn.remove();
+                return;
+            }
 
-                const hitEl = target.closest("[data-hit]");
-                if (hitEl) {
-                    const hit = this.hitMap.get(hitEl.getAttribute("data-hit") || "");
-                    if (hit) void this.openAt(hit.path, hit.line);
-                    return;
-                }
+            const hitEl = target.closest("[data-hit]");
+            if (hitEl) {
+                const hit = this.hitMap.get(hitEl.getAttribute("data-hit") || "");
+                if (hit) void this.openAt(hit.path, hit.line);
+                return;
+            }
 
-                const openEl = target.closest("[data-open]");
-                if (openEl) {
-                    const idx = parseInt(openEl.getAttribute("data-open") || "-1", 10);
-                    const entry = this.entries[idx];
-                    if (entry) void this.openAt(entry.path, 0);
-                }
-            });
-        }
+            const openEl = target.closest("[data-open]");
+            if (openEl) {
+                const idx = parseInt(openEl.getAttribute("data-open") || "-1", 10);
+                const entry = this.entries[idx];
+                if (entry) void this.openAt(entry.path, 0);
+            }
+        });
 
         window.setTimeout(() => this.focusInput(), 60);
     }
@@ -369,11 +375,12 @@ export class TimelineView extends ItemView {
     private async openAt(path: string, line: number) {
         const file = this.plugin.app.vault.getAbstractFileByPath(path);
         if (!(file instanceof TFile)) {
-            new Notice(`文件不存在：${path}`);
+            new Notice(T().missingFile + path);
             return;
         }
         const leaf = this.plugin.app.workspace.getLeaf(false);
-        await leaf.openFile(file, { eState: { line } });
+        await leaf.openFile(file);
+        if (line > 0) leaf.setEphemeralState({ line });
         this.plugin.app.workspace.revealLeaf(leaf);
     }
 
@@ -381,23 +388,22 @@ export class TimelineView extends ItemView {
         return this.sortMode === "created" ? file.stat.ctime : file.stat.mtime;
     }
 
-    private renderSnippets(hits: EntryHit[], limit: number): string {
+    private buildSnippet(hit: EntryHit, parent: HTMLElement) {
         const zh = isZh();
-        return hits
-            .slice(0, limit)
-            .map((hit) => {
-                const label = TYPE_LABELS[hit.type] || TYPE_LABELS.p;
-                const typeLabel = zh ? label.zh : label.en;
-                return `<div class="kts-snip" data-hit="${hit.key}">
-  <span class="kts-tag">${escapeHtml(typeLabel)}</span>
-  <span class="kts-text">${highlight(escapeHtml(snippetAround(hit.content, this.keywords)), this.keywords)}</span>
-</div>`;
-            })
-            .join("");
+        const label = TYPE_LABELS[hit.type] || TYPE_LABELS.p;
+        const row = parent.createDiv({ cls: "kts-snip" });
+        row.setAttr("data-hit", hit.key);
+        row.createSpan({ cls: "kts-tag", text: zh ? label.zh : label.en });
+        const textEl = row.createSpan({ cls: "kts-text" });
+        appendHighlighted(textEl, snippetAround(hit.content, this.keywords), this.keywords);
     }
 
-    private renderChips(entries: DocEntry[]): string {
-        if (entries.length === 0) return "";
+    private renderChips(entries: DocEntry[]) {
+        const el = this.chipsEl;
+        if (!el) return;
+        el.empty();
+        if (entries.length === 0) return;
+
         const t = T();
         const now = Date.now();
         const chips: { days: number; label: string }[] = [
@@ -407,21 +413,22 @@ export class TimelineView extends ItemView {
             { days: 90, label: t.chip90 },
             { days: 365, label: t.chip365 },
         ];
-        return chips
-            .map((c) => {
-                const count =
-                    c.days === 0
-                        ? entries.length
-                        : entries.filter((e) => {
-                              const d = parseTime(e.time);
-                              return d !== null && now - d.getTime() <= c.days * 86400000;
-                          }).length;
-                const active =
-                    (c.days === 0 && this.timeFilter.type === "all") ||
-                    (this.timeFilter.type === "days" && this.timeFilter.days === c.days);
-                return `<button class="kts-chip${active ? " kts-chip-on" : ""}" data-days="${c.days}">${escapeHtml(c.label)}<em>${count}</em></button>`;
-            })
-            .join("");
+        for (const c of chips) {
+            const count =
+                c.days === 0
+                    ? entries.length
+                    : entries.filter((e) => {
+                          const d = parseTime(e.time);
+                          return d !== null && now - d.getTime() <= c.days * 86400000;
+                      }).length;
+            const active =
+                (c.days === 0 && this.timeFilter.type === "all") ||
+                (this.timeFilter.type === "days" && this.timeFilter.days === c.days);
+            const btn = el.createEl("button", { cls: active ? "kts-chip kts-chip-on" : "kts-chip" });
+            btn.setAttr("data-days", String(c.days));
+            btn.appendText(c.label);
+            btn.createEl("em", { text: String(count) });
+        }
     }
 
     private filterEntries(entries: DocEntry[]): DocEntry[] {
@@ -434,26 +441,49 @@ export class TimelineView extends ItemView {
         });
     }
 
+    /** 空状态：可选图标 + 文案，全部走 DOM 构建 */
+    private renderEmpty(text: string, withIcon: boolean) {
+        const el = this.timelineEl;
+        if (!el) return;
+        el.empty();
+        const box = el.createDiv({ cls: "kts-empty" });
+        if (withIcon) {
+            const iconEl = box.createDiv({ cls: "kts-empty-icon" });
+            setIcon(iconEl, "search");
+        }
+        box.createDiv({ cls: "kts-empty-text", text });
+    }
+
+    private renderMeta(shown: DocEntry[], hitCount: number, span: string) {
+        const el = this.metaEl;
+        if (!el) return;
+        const t = T();
+        el.empty();
+        el.createEl("b", { text: String(shown.length) });
+        el.appendText(` ${t.resultDocs} · `);
+        el.createEl("b", { text: String(hitCount) });
+        el.appendText(` ${t.resultBlocks}`);
+        if (span) {
+            el.appendText(" · ");
+            el.createSpan({ cls: "kts-span", text: span });
+        }
+        el.createSpan({ cls: "kts-ver", text: `v${PLUGIN_VERSION}` });
+    }
+
     private renderAll() {
         const t = T();
-        const root = this.contentEl;
-        const metaEl = root.querySelector<HTMLElement>(".kts-meta");
-        const chipsEl = root.querySelector<HTMLElement>(".kts-chips");
-        const timelineEl = root.querySelector<HTMLElement>(".kts-timeline");
-        if (!metaEl || !chipsEl || !timelineEl) return;
+        const timelineEl = this.timelineEl;
+        if (!timelineEl || !this.metaEl) return;
 
         const shown = this.filterEntries(this.entries);
-        chipsEl.innerHTML = this.renderChips(this.entries);
+        this.renderChips(this.entries);
 
         let hitCount = 0;
         for (const e of shown) hitCount += e.hits.length;
 
         if (shown.length === 0) {
-            metaEl.textContent = "";
-            timelineEl.innerHTML = `<div class="kts-empty">
-  <div class="kts-empty-icon">${SEARCH_ICON}</div>
-  <div class="kts-empty-text">${escapeHtml(this.entries.length === 0 ? t.noResult : t.noResultInFilter)}</div>
-</div>`;
+            this.metaEl.empty();
+            this.renderEmpty(this.entries.length === 0 ? t.noResult : t.noResultInFilter, true);
             return;
         }
 
@@ -465,9 +495,7 @@ export class TimelineView extends ItemView {
             times.length > 1
                 ? `${formatFullTime(times[0]).slice(0, 10)} — ${formatFullTime(times[times.length - 1]).slice(0, 10)}`
                 : formatFullTime(times[0] || "").slice(0, 10);
-        metaEl.innerHTML = `<b>${shown.length}</b> ${escapeHtml(t.resultDocs)} · <b>${hitCount}</b> ${escapeHtml(
-            t.resultBlocks
-        )}${span ? ` · <span class="kts-span">${escapeHtml(span)}</span>` : ""}<span class="kts-ver">v${PLUGIN_VERSION}</span>`;
+        this.renderMeta(shown, hitCount, span);
 
         const dayCount = new Map<string, number>();
         for (const e of shown) {
@@ -475,60 +503,61 @@ export class TimelineView extends ItemView {
             dayCount.set(key, (dayCount.get(key) || 0) + 1);
         }
 
-        const parts: string[] = [];
-        let lastMonth = "";
-        let lastDay = "";
         const indexOf = new Map<string, number>();
         shown.forEach((e, i) => indexOf.set(e.path, i));
+
+        timelineEl.empty();
+        let lastMonth = "";
+        let lastDay = "";
 
         for (const entry of shown) {
             const idx = indexOf.get(entry.path) ?? 0;
             const month = entry.time.slice(0, 6);
             if (month && month !== lastMonth) {
                 lastMonth = month;
-                parts.push(`<div class="kts-month"><span>${escapeHtml(monthLabel(entry.time))}</span></div>`);
+                timelineEl.createDiv({ cls: "kts-month" }).createSpan({ text: monthLabel(entry.time) });
             }
             const day = entry.time.slice(0, 8) || "unknown";
             if (day !== lastDay) {
                 lastDay = day;
                 const label = day === "unknown" ? t.unknownTime : dayLabel(entry.time, t.today, t.yesterday);
                 const cnt = dayCount.get(day) || 0;
-                parts.push(
-                    `<div class="kts-day"><span class="kts-day-label">${escapeHtml(label)}</span><span class="kts-day-count">${cnt} ${escapeHtml(
-                        t.docUnit(cnt)
-                    )}</span></div>`
-                );
+                const dayEl = timelineEl.createDiv({ cls: "kts-day" });
+                dayEl.createSpan({ cls: "kts-day-label", text: label });
+                dayEl.createSpan({ cls: "kts-day-count", text: `${cnt} ${t.docUnit(cnt)}` });
             }
 
             const showAll = this.expanded.has(entry.path);
             const limit = showAll ? entry.hits.length : 3;
             const rest = entry.hits.length - limit;
-            parts.push(`<div class="kts-node">
-  <span class="kts-dot"></span>
-  <div class="kts-card">
-    <div class="kts-card-head">
-      <span class="kts-title" data-open="${idx}" title="${escapeHtml(t.open)}">${highlight(
-                escapeHtml(entry.title),
-                this.keywords
-            )}</span>
-      <span class="kts-time">${hhmm(entry.time)}</span>
-    </div>
-    <div class="kts-snips" data-snips="${idx}">${this.renderSnippets(entry.hits, limit)}</div>
-    ${rest > 0 ? `<button class="kts-more" data-more="${idx}">${escapeHtml(t.moreHits)} ${rest} ${escapeHtml(t.hitUnit)}</button>` : ""}
-  </div>
-</div>`);
-        }
 
-        timelineEl.innerHTML = parts.join("");
+            const node = timelineEl.createDiv({ cls: "kts-node" });
+            node.createSpan({ cls: "kts-dot" });
+            const card = node.createDiv({ cls: "kts-card" });
+            const cardHead = card.createDiv({ cls: "kts-card-head" });
+
+            const titleEl = cardHead.createSpan({ cls: "kts-title" });
+            titleEl.setAttr("data-open", String(idx));
+            titleEl.setAttr("title", t.open);
+            appendHighlighted(titleEl, entry.title, this.keywords);
+            cardHead.createSpan({ cls: "kts-time", text: hhmm(entry.time) });
+
+            const snips = card.createDiv({ cls: "kts-snips" });
+            snips.setAttr("data-snips", String(idx));
+            for (const hit of entry.hits.slice(0, limit)) this.buildSnippet(hit, snips);
+
+            if (rest > 0) {
+                const moreBtn = card.createEl("button", { cls: "kts-more" });
+                moreBtn.setAttr("data-more", String(idx));
+                moreBtn.appendText(`${t.moreHits} ${rest} ${t.hitUnit}`);
+            }
+        }
     }
 
     private async search() {
         const t = T();
-        const root = this.contentEl;
-        const timelineEl = root.querySelector<HTMLElement>(".kts-timeline");
-        const metaEl = root.querySelector<HTMLElement>(".kts-meta");
-        const chipsEl = root.querySelector<HTMLElement>(".kts-chips");
-        if (!timelineEl || !metaEl || !chipsEl) return;
+        const timelineEl = this.timelineEl;
+        if (!timelineEl || !this.metaEl || !this.chipsEl) return;
 
         const raw = this.inputEl?.value || "";
         const keywords = raw.trim().split(/\s+/).filter((k) => k.length > 0);
@@ -536,17 +565,18 @@ export class TimelineView extends ItemView {
             this.keywords = [];
             this.entries = [];
             this.hitMap.clear();
-            metaEl.textContent = "";
-            chipsEl.innerHTML = "";
-            timelineEl.innerHTML = `<div class="kts-hint">${escapeHtml(t.idle)}</div>`;
+            this.metaEl.empty();
+            this.chipsEl.empty();
+            timelineEl.empty();
+            timelineEl.createDiv({ cls: "kts-hint", text: t.idle });
             return;
         }
         this.keywords = keywords;
 
         const seq = ++this.seq;
-        metaEl.textContent = t.searching;
-        chipsEl.innerHTML = "";
-        timelineEl.innerHTML = "";
+        this.metaEl.setText(t.searching);
+        this.chipsEl.empty();
+        timelineEl.empty();
 
         const lower = keywords.map((k) => k.toLowerCase());
         const files = this.plugin.app.vault.getMarkdownFiles().slice();
@@ -574,7 +604,7 @@ export class TimelineView extends ItemView {
                     if (!content) continue;
                     const key = `h${hitSeq++}`;
                     this.hitMap.set(key, { path: file.path, line: i });
-                    hits.push({ key, type: lineType(lines[i]), content, line: i });
+                    hits.push({ key, type: lineType(lines[i]), content });
                 }
                 if (hits.length === 0) continue;
 
@@ -592,10 +622,8 @@ export class TimelineView extends ItemView {
         } catch (err) {
             if (seq !== this.seq) return;
             const msg = err instanceof Error ? err.message : String(err);
-            metaEl.textContent = "";
-            timelineEl.innerHTML = `<div class="kts-empty"><div class="kts-empty-text">${escapeHtml(
-                t.searchFailed + msg
-            )}</div></div>`;
+            this.metaEl.empty();
+            this.renderEmpty(t.searchFailed + msg, false);
             new Notice(t.searchFailed + msg);
             return;
         }
@@ -603,7 +631,6 @@ export class TimelineView extends ItemView {
         if (seq !== this.seq) return;
 
         this.entries = entries;
-        this.entryCache = new Map(entries.map((e) => [e.path, e]));
         this.timeFilter = { type: "all" };
         this.expanded.clear();
         this.renderAll();
@@ -618,7 +645,7 @@ export default class KeywordTimeSearchPlugin extends Plugin {
 
         this.addCommand({
             id: "open-timeline-search",
-            name: "按时间搜索关键词 / Search keywords on a timeline",
+            name: T().commandName,
             hotkeys: [{ modifiers: ["Mod", "Alt"], key: "F" }],
             callback: () => void this.activateView(),
         });
